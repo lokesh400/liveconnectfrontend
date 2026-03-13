@@ -7,9 +7,10 @@ import {
   StatusBar,
   Animated,
   Platform,
+  useWindowDimensions,
 } from "react-native";
 import { WebView } from "react-native-webview";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons } from "@expo/vector-icons";
 import * as ScreenOrientation from "expo-screen-orientation";
@@ -38,14 +39,43 @@ function PulseDot({ size = 8 }) {
 
 export default function CameraScreen({ route, navigation }) {
   const { cameraId } = route.params;
+  const { width, height } = useWindowDimensions();
+  const insets = useSafeAreaInsets();
+  const portraitBottomInset = Math.max(insets.bottom, 14);
+  const portraitVideoHeight = Math.max(250, Math.min(height * 0.44, width * 1.24));
 
   const [micOn, setMicOn] = useState(false);
   const [isLandscape, setIsLandscape] = useState(false);
-  const [savedToast, setSavedToast] = useState(false);
+  const [captureToast, setCaptureToast] = useState({ visible: false, type: "success", message: "" });
+  const [isCapturing, setIsCapturing] = useState(false);
+  const [frameTime, setFrameTime] = useState(null);
+  const [activeDir, setActiveDir] = useState(null);
 
   useEffect(() => {
     ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT);
   }, []);
+
+  // Poll backend for frame timestamp
+  useEffect(() => {
+    const fetchTimestamp = async () => {
+      try {
+        const res = await fetch(`${API_BASE_URL}/timestamp/${cameraId}`);
+        if (res.ok) {
+          const data = await res.json();
+          setFrameTime(data.timestamp);
+        }
+      } catch (_) {}
+    };
+    fetchTimestamp();
+    const interval = setInterval(fetchTimestamp, 1000);
+    return () => clearInterval(interval);
+  }, [cameraId]);
+
+  const formatTimestamp = (iso) => {
+    if (!iso) return "--:--:--";
+    const d = new Date(iso);
+    return d.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true }) + "  " + d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+  };
 
   const toggleOrientation = async () => {
     if (isLandscape) {
@@ -57,18 +87,116 @@ export default function CameraScreen({ route, navigation }) {
   };
 
   const takeScreenshot = async () => {
-    const permission = await MediaLibrary.requestPermissionsAsync();
-    if (!permission.granted) return;
-    const fileUri = FileSystem.cacheDirectory + "snapshot.jpg";
-    await FileSystem.downloadAsync(`${API_BASE_URL}/snapshot/${cameraId}`, fileUri);
-    await MediaLibrary.saveToLibraryAsync(fileUri);
-    setSavedToast(true);
-    setTimeout(() => setSavedToast(false), 2000);
+    if (isCapturing) return;
+
+    try {
+      setIsCapturing(true);
+
+      const permission = await MediaLibrary.requestPermissionsAsync();
+      if (!permission.granted) {
+        setCaptureToast({ visible: true, type: "error", message: "Gallery permission denied" });
+        return;
+      }
+
+      const captureDir = `${FileSystem.documentDirectory}captures/`;
+      await FileSystem.makeDirectoryAsync(captureDir, { intermediates: true });
+
+      const fileUri = `${captureDir}${cameraId}-${Date.now()}.jpg`;
+      const download = await FileSystem.downloadAsync(`${API_BASE_URL}/snapshot/${cameraId}`, fileUri);
+
+      if (download.status !== 200) {
+        throw new Error(`Snapshot request failed with status ${download.status}`);
+      }
+
+      const asset = await MediaLibrary.createAssetAsync(download.uri);
+
+      try {
+        const album = await MediaLibrary.getAlbumAsync("LiveConnect");
+        if (album) {
+          await MediaLibrary.addAssetsToAlbumAsync([asset], album, false);
+        } else {
+          await MediaLibrary.createAlbumAsync("LiveConnect", asset, false);
+        }
+      } catch (_) {
+        // Fall back to the default gallery if album operations are unavailable.
+      }
+
+      setCaptureToast({ visible: true, type: "success", message: "Screenshot saved to gallery" });
+    } catch (_) {
+      setCaptureToast({ visible: true, type: "error", message: "Unable to save screenshot" });
+    } finally {
+      setIsCapturing(false);
+      setTimeout(() => {
+        setCaptureToast((current) => ({ ...current, visible: false }));
+      }, 2200);
+    }
   };
 
-  const moveServo = (x, y) => {
-    fetch(`${API_BASE_URL}/servo/${cameraId}?x=${x}&y=${y}`);
+  const pressDir = async (dir) => {
+    setActiveDir(dir);
+    try {
+      await fetch(`${API_BASE_URL}/move/${cameraId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ direction: dir }),
+      });
+    } catch (_) {
+      // network error – silently ignore so the UI never freezes
+    } finally {
+      setActiveDir(null);
+    }
   };
+
+  const streamUri = `${API_BASE_URL}/stream/${cameraId}?fps=10`;
+  const streamHtml = `
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <meta
+          name="viewport"
+          content="width=device-width, height=device-height, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+        />
+        <style>
+          html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #000;
+          }
+
+          body {
+            position: fixed;
+            inset: 0;
+          }
+
+          .stream-shell {
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+            background: #000;
+          }
+
+          .stream-frame {
+            width: 100%;
+            height: 100%;
+            display: block;
+            object-fit: contain;
+            background: #000;
+            user-select: none;
+            -webkit-user-drag: none;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="stream-shell">
+          <img class="stream-frame" src="${streamUri}" alt="${cameraId} live stream" />
+        </div>
+      </body>
+    </html>
+  `;
 
   /* ─── Action Button Helper ─── */
   const ActionButton = ({ icon, label, onPress, active, accent }) => (
@@ -85,9 +213,18 @@ export default function CameraScreen({ route, navigation }) {
       <StatusBar barStyle="light-content" backgroundColor="#000" hidden={isLandscape} />
 
       {/* ─── Stream (fills the screen) ─── */}
-      <View style={styles.videoWrapper}>
+      <View
+        style={[
+          styles.videoWrapper,
+          isLandscape
+            ? styles.videoWrapperLandscape
+            : [styles.videoWrapperPortrait, { height: portraitVideoHeight, marginTop: insets.top + 10 }],
+        ]}
+      >
         <WebView
-          source={{ uri: `${API_BASE_URL}/stream/${cameraId}?fps=10` }}
+          key={isLandscape ? "landscape-stream" : "portrait-stream"}
+          originWhitelist={["*"]}
+          source={{ html: streamHtml, baseUrl: API_BASE_URL }}
           style={styles.webview}
           allowsFullscreenVideo
           allowsInlineMediaPlayback
@@ -101,16 +238,7 @@ export default function CameraScreen({ route, navigation }) {
           nestedScrollEnabled={false}
           showsHorizontalScrollIndicator={false}
           showsVerticalScrollIndicator={false}
-          injectedJavaScript={`
-            (function(){
-              var s = document.createElement('style');
-              s.textContent = 'html,body{margin:0;padding:0;overflow:hidden!important;width:100vw;height:100vh;background:#000;touch-action:none;-webkit-overflow-scrolling:auto;} img,video,canvas{width:100vw!important;height:100vh!important;object-fit:contain!important;display:block!important;}';
-              document.head.appendChild(s);
-              document.addEventListener('touchmove',function(e){e.preventDefault();},{passive:false});
-              window.scrollTo(0,0);
-            })();
-            true;
-          `}
+          mixedContentMode="always"
           onMessage={() => {}}
         />
 
@@ -121,7 +249,7 @@ export default function CameraScreen({ route, navigation }) {
             style={styles.overlayTop}
             pointerEvents="box-none"
           >
-            <SafeAreaView edges={["top"]} style={styles.overlayTopInner}>
+            <View style={[styles.overlayTopInner, styles.overlayTopInnerPortrait]}>
               <TouchableOpacity style={styles.backBtn} onPress={() => navigation.goBack()} activeOpacity={0.75}>
                 <Ionicons name="chevron-back" size={22} color="#fff" />
               </TouchableOpacity>
@@ -130,9 +258,22 @@ export default function CameraScreen({ route, navigation }) {
                 <PulseDot size={7} />
                 <Text style={styles.liveText}>LIVE</Text>
               </View>
-            </SafeAreaView>
+            </View>
           </LinearGradient>
         )}
+
+        {/* Timestamp overlay — bottom-left */}
+        <View
+          style={[
+            styles.timestampBadge,
+            isLandscape
+              ? styles.timestampBadgeLandscape
+              : styles.timestampBadgePortrait,
+          ]}
+        >
+          <Ionicons name="time-outline" size={12} color="#9fb3c8" />
+          <Text style={styles.timestampText}>{formatTimestamp(frameTime)}</Text>
+        </View>
 
         {/* Landscape: only a rotate-back button in bottom-right */}
         {isLandscape && (
@@ -146,32 +287,66 @@ export default function CameraScreen({ route, navigation }) {
         )}
 
         {/* Toast */}
-        {savedToast && (
-          <View style={styles.toast}>
-            <Ionicons name="checkmark-circle" size={16} color="#34d399" />
-            <Text style={styles.toastText}>Saved to gallery</Text>
+        {captureToast.visible && (
+          <View
+            style={[
+              styles.toast,
+              captureToast.type === "error" ? styles.toastError : styles.toastSuccess,
+              !isLandscape && styles.toastPortrait,
+            ]}
+          >
+            <Ionicons
+              name={captureToast.type === "error" ? "alert-circle" : "checkmark-circle"}
+              size={16}
+              color={captureToast.type === "error" ? "#fca5a5" : "#34d399"}
+            />
+            <Text style={[styles.toastText, captureToast.type === "error" && styles.toastTextError]}>
+              {captureToast.message}
+            </Text>
           </View>
         )}
       </View>
 
       {/* ─── Bottom Controls — hidden in landscape ─── */}
       {!isLandscape && (
-        <View style={styles.controlsBar}>
+        <View
+          style={[
+            styles.controlsBar,
+            styles.controlsBarPortrait,
+            { paddingBottom: portraitBottomInset },
+          ]}
+        >
           {/* D-Pad compact */}
           <View style={styles.dpadCompact}>
-            <TouchableOpacity style={styles.arrowBtn} onPress={() => moveServo(20, 90)} activeOpacity={0.7}>
-              <Ionicons name="chevron-back" size={20} color="#18e3c6" />
+            <TouchableOpacity
+              style={[styles.arrowBtn, activeDir === "left" && styles.arrowBtnActive]}
+              onPress={() => pressDir("left")}
+              activeOpacity={0.7}
+            >
+              <Ionicons name="chevron-back" size={20} color={activeDir === "left" ? "#fff" : "#18e3c6"} />
             </TouchableOpacity>
             <View style={styles.dpadVertical}>
-              <TouchableOpacity style={styles.arrowBtn} onPress={() => moveServo(90, 20)} activeOpacity={0.7}>
-                <Ionicons name="chevron-up" size={20} color="#18e3c6" />
+              <TouchableOpacity
+                style={[styles.arrowBtn, activeDir === "up" && styles.arrowBtnActive]}
+                onPress={() => pressDir("up")}
+                activeOpacity={0.7}
+              >
+                <Ionicons name="chevron-up" size={20} color={activeDir === "up" ? "#fff" : "#18e3c6"} />
               </TouchableOpacity>
-              <TouchableOpacity style={styles.arrowBtn} onPress={() => moveServo(90, 160)} activeOpacity={0.7}>
-                <Ionicons name="chevron-down" size={20} color="#18e3c6" />
+              <TouchableOpacity
+                style={[styles.arrowBtn, activeDir === "down" && styles.arrowBtnActive]}
+                onPress={() => pressDir("down")}
+                activeOpacity={0.7}
+              >
+                <Ionicons name="chevron-down" size={20} color={activeDir === "down" ? "#fff" : "#18e3c6"} />
               </TouchableOpacity>
             </View>
-            <TouchableOpacity style={styles.arrowBtn} onPress={() => moveServo(160, 90)} activeOpacity={0.7}>
-              <Ionicons name="chevron-forward" size={20} color="#18e3c6" />
+            <TouchableOpacity
+              style={[styles.arrowBtn, activeDir === "right" && styles.arrowBtnActive]}
+              onPress={() => pressDir("right")}
+              activeOpacity={0.7}
+            >
+              <Ionicons name="chevron-forward" size={20} color={activeDir === "right" ? "#fff" : "#18e3c6"} />
             </TouchableOpacity>
           </View>
 
@@ -181,7 +356,7 @@ export default function CameraScreen({ route, navigation }) {
           {/* Action buttons */}
           <View style={styles.actionsRow}>
             <ActionButton icon={micOn ? "mic" : "mic-off"} label={micOn ? "Mute" : "Mic"} onPress={() => setMicOn(!micOn)} active={micOn} accent="#60a5fa" />
-            <ActionButton icon="camera-outline" label="Capture" onPress={takeScreenshot} />
+            <ActionButton icon={isCapturing ? "hourglass-outline" : "camera-outline"} label={isCapturing ? "Saving" : "Capture"} onPress={takeScreenshot} active={isCapturing} accent="#34d399" />
             <ActionButton icon="phone-landscape-outline" label="Rotate" onPress={toggleOrientation} />
           </View>
         </View>
@@ -198,11 +373,20 @@ const styles = StyleSheet.create({
 
   /* ─── Video (fills screen) ─── */
   videoWrapper: {
-    flex: 1,
     backgroundColor: "#000",
   },
+  videoWrapperLandscape: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  videoWrapperPortrait: {
+    marginHorizontal: 6,
+    borderRadius: 10,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.08)",
+  },
   webview: {
-    flex: 1,
+    ...StyleSheet.absoluteFillObject,
     backgroundColor: "#000",
   },
 
@@ -219,6 +403,10 @@ const styles = StyleSheet.create({
     alignItems: "center",
     paddingHorizontal: 16,
     paddingBottom: 12,
+  },
+  overlayTopInnerPortrait: {
+    paddingTop: 6,
+    paddingBottom: 6,
   },
   backBtn: {
     width: 38,
@@ -274,6 +462,45 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "600",
   },
+  toastSuccess: {
+    borderColor: "rgba(52,211,153,0.3)",
+  },
+  toastError: {
+    borderColor: "rgba(248,113,113,0.32)",
+  },
+  toastTextError: {
+    color: "#fca5a5",
+  },
+
+  /* Timestamp badge */
+  timestampBadge: {
+    position: "absolute",
+    bottom: 12,
+    left: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    backgroundColor: "rgba(0,0,0,0.6)",
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    zIndex: 15,
+  },
+  timestampBadgeLandscape: {
+    bottom: 16,
+    left: 16,
+  },
+  timestampBadgePortrait: {
+    bottom: 20,
+    left: 14,
+  },
+  timestampText: {
+    color: "#cbd5e1",
+    fontSize: 11,
+    fontWeight: "600",
+    fontVariant: ["tabular-nums"],
+    letterSpacing: 0.3,
+  },
 
   /* Landscape rotate button */
   landscapeRotateBtn: {
@@ -293,12 +520,32 @@ const styles = StyleSheet.create({
   controlsBar: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#0a0e14",
+    backgroundColor: "rgba(10,14,20,0.84)",
     paddingVertical: 14,
     paddingHorizontal: 16,
-    paddingBottom: Platform.OS === "ios" ? 30 : 16,
-    borderTopWidth: 1,
-    borderTopColor: "rgba(255,255,255,0.06)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.08)",
+    borderRadius: 22,
+    zIndex: 20,
+    ...Platform.select({
+      ios: {
+        shadowColor: "#000",
+        shadowOffset: { width: 0, height: 10 },
+        shadowOpacity: 0.35,
+        shadowRadius: 18,
+      },
+      android: { elevation: 12 },
+    }),
+  },
+  controlsBarPortrait: {
+    position: "absolute",
+    left: 12,
+    right: 12,
+    bottom: 0,
+    paddingTop: 16,
+  },
+  toastPortrait: {
+    bottom: 18,
   },
 
   /* D-Pad compact */
@@ -319,6 +566,10 @@ const styles = StyleSheet.create({
     borderColor: "rgba(24,227,198,0.18)",
     alignItems: "center",
     justifyContent: "center",
+  },
+  arrowBtnActive: {
+    backgroundColor: "rgba(24,227,198,0.35)",
+    borderColor: "rgba(24,227,198,0.75)",
   },
 
   /* Divider */
